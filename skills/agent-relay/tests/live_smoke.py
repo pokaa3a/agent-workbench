@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in real CLI smoke test. Uses existing accounts and may incur model usage.
 
-Run one case with: python3 live_smoke.py codex|claude|mixed
+Run one case with: python3 live_smoke.py mixed --approve-test
 Artifacts stay in the printed temporary directory for inspection.
 """
 import json
@@ -39,19 +39,22 @@ def main():
     workspace = root / 'workspace'
     workspace.mkdir()
     subprocess.run(['git', 'init', '-q', str(workspace)], check=True)
-    prompt = root / 'prompt.txt'
+    private = root / '.workspace'
+    private.mkdir()
+    prompt = private / 'prompt.txt'
     prompt.write_text('Build ledger.txt in the workspace over four relay turns. During EACH turn, '
         'read the current ledger if it exists, assess its correctness, and append EXACTLY ONE line '
         'formatted ITERATION WORKER using your assigned integer iteration and worker name from '
         'the relay task context. Preserve all previous lines. Do not add a header or extra text. '
         'Do not write future iterations. Use file tools to make the actual change. '
-        'Verify the file after editing. This is a small test; do not browse or delegate.')
-    criteria = root / 'criteria.txt'
+        'Verify the file after editing. Write a short supporting note in scratch_directory/support.txt. '
+        'Keep all optional working files in that hidden directory. This is a small test; do not browse or delegate.')
+    criteria = private / 'criteria.txt'
     criteria.write_text('After four turns ledger.txt contains exactly four ordered lines, '
                         'each matching that turn number and its assigned worker. '
                         'On each turn only one line is appended and all earlier lines are preserved.')
     args = ['init', '--workspace', str(workspace), '--prompt-file', str(prompt),
-            '--criteria-file', str(criteria), '--max-iterations', '4', '--save-dir', str(root / 'run')]
+            '--criteria-file', str(criteria), '--max-iterations', '4', '--save-dir', str(workspace / 'relay-output')]
     for worker in workers:
         args += ['--worker', worker]
     names = {'codex': ['codex-1', 'codex-2'], 'claude': ['claude-1', 'claude-2'],
@@ -64,7 +67,7 @@ def main():
                 args += ['--worker-' + field, name + '=' + value]
     created = call(*args)
     run = created['run']
-    approval = root / 'confirmation.txt'
+    approval = private / 'confirmation.txt'
     approval.write_text('The caller explicitly authorized this isolated four-turn live smoke test '
                         'with --approve-test and these configuration arguments: ' + json.dumps(args))
     call('confirm', '--run', run, '--confirmation-file', str(approval))
@@ -76,7 +79,7 @@ def main():
         actual = (workspace / 'ledger.txt').read_text().splitlines()
         if actual != expected:
             raise AssertionError('Artifact mismatch: %r != %r' % (actual, expected))
-        evidence = root / ('review-%d.txt' % (n + 1))
+        evidence = private / ('review-%d.txt' % (n + 1))
         evidence.write_text('Host read ledger.txt and verified exact ordered content: %r. '
                             'All previous entries were preserved. %s' %
                             (actual, 'Four-turn goal is met.' if n == 3 else 'Continue with one new line.'))
@@ -84,16 +87,25 @@ def main():
                      '--evidence-file', str(evidence))
         print(json.dumps({'case': case, 'iteration': n + 1, 'worker': turn['worker'],
                           'session_id': turn['session_id'], 'status': state['status']}), flush=True)
+    reports = Path(run) / 'iterations'
+    assert sorted(p.name for p in reports.iterdir()) == ['iteration-%d.md' % n for n in range(1, 5)]
+    for n in range(1, 5):
+        report = (reports / ('iteration-%d.md' % n)).read_text()
+        assert '## Assessment' in report and '## Host review' in report
+    assert {p.name for p in Path(run).iterdir()} == {'.workspace', 'iterations'}
+    for worker in state['workers']:
+        assert (Path(run) / '.workspace' / 'workers' / worker['name'] / 'support.txt').is_file()
     turns = state['turns']
     assert turns[0]['session_id'] == turns[2]['session_id']
     assert turns[1]['session_id'] == turns[3]['session_id']
     assert turns[0]['session_id'] != turns[1]['session_id']
     assert state['status'] == 'completed'
-    summary = root / 'summary.md'
+    summary = private / 'summary.md'
     summary.write_text('Passed %s relay: four real worker turns, two distinct session IDs reused '
                        'on turns three and four, handoffs parsed, artifact checked by the host '
                        'after every turn, and host accepted the final result.\n' % case)
     call('finish', '--run', run, '--summary-file', str(summary))
+    assert {p.name for p in Path(run).iterdir()} == {'.workspace', 'iterations'}
     print(json.dumps({'case': case, 'passed': True, 'artifacts': str(root)}), flush=True)
 
 

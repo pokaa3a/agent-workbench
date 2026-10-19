@@ -154,7 +154,7 @@ class RelayTests(unittest.TestCase):
         with patch.object(relay.shutil, 'which', return_value='/fake'), patch.object(relay, 'execute', return_value='not json'):
             with self.assertRaises(ValueError):
                 relay.step(run, state, argparse.Namespace(timeout=5))
-        self.assertEqual(relay.read(run / 'state.json')['status'], 'blocked')
+        self.assertEqual(relay.read(relay.storage(run) / 'state.json')['status'], 'blocked')
         with self.assertRaises(ValueError):
             relay.step(run, state, argparse.Namespace(timeout=5))
 
@@ -204,11 +204,12 @@ class RelayTests(unittest.TestCase):
         self.assertNotEqual(cli('cleanup', '--run', str(run)).returncode, 0)
         state = result['state']
         state['status'] = 'blocked'
-        relay.write(run / 'state.json', state)
+        relay.write(relay.storage(run) / 'state.json', state)
         summary = self.root / 'final.md'
         summary.write_text('Blocked before acceptance; no task completion is claimed.')
         self.assertEqual(cli('finish', '--run', str(run), '--summary-file', str(summary)).returncode, 0)
-        self.assertTrue((run / 'final.md').exists())
+        self.assertFalse((run / 'final.md').exists())
+        self.assertEqual(relay.read(relay.storage(run) / 'state.json')['final'], summary.read_text())
         self.assertEqual(cli('cleanup', '--run', str(run)).returncode, 0)
         self.assertFalse(run.exists())
 
@@ -248,7 +249,7 @@ class RelayTests(unittest.TestCase):
                       'Error: failed to initialize in-process app-server client: Operation not permitted')
         self.fail_attempt(run, state, diagnostic=diagnostic)
         self.assertEqual(state['error_kind'], 'startup_environment_blocked')
-        old_log = run / 'turn-0001-attempt-01.stderr'
+        old_log = relay.storage(run) / 'turn-0001-attempt-01.stderr'
         with self.assertRaisesRegex(ValueError, 'No known session'):
             relay.recover(run, state, self.recovery_args())
         relay.recover(run, state, self.recovery_args(no_session_found=True, authorize_initial_start=True))
@@ -258,7 +259,7 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(len(state['turns']), 1)
         self.assertEqual(len(state['attempts']), 2)
         self.assertEqual(old_log.read_text(), diagnostic)
-        self.assertTrue((run / 'turn-0001-attempt-02.prompt.txt').exists())
+        self.assertTrue((relay.storage(run) / 'turn-0001-attempt-02.prompt.txt').exists())
         self.assertEqual(self.contexts[-1]['recovery_context'][0]['execution_context'], 'approved')
 
     def test_known_session_survives_bad_handoff_and_is_resumed(self):
@@ -345,6 +346,80 @@ class RelayTests(unittest.TestCase):
         with patch.object(relay.os, 'killpg', side_effect=ProcessLookupError()):
             relay.recover(run, state, self.recovery_args(no_session_found=True, authorize_initial_start=True))
         self.assertEqual(state['status'], 'ready')
+
+    def test_output_has_one_readable_report_per_iteration(self):
+        run, state = self.create(['codex:1'], limit=2)
+        self.contexts = []
+        self.assertEqual({p.name for p in run.iterdir()}, {'.workspace', 'iterations'})
+        with patch.object(relay.shutil, 'which', return_value='/fake'), patch.object(relay, 'execute', side_effect=self.fake_execute):
+            for n in range(2):
+                relay.step(run, state, argparse.Namespace(timeout=5))
+                path = run / 'iterations' / ('iteration-%d.md' % (n + 1))
+                self.assertIn('Awaiting host review', path.read_text())
+                self.review(run, state)
+                text = path.read_text()
+                self.assertIn('## Assessment', text)
+                self.assertIn('## Work completed', text)
+                self.assertIn('## Verification', text)
+                self.assertIn('## Host review', text)
+                self.assertIn(self.evidence.read_text(), text)
+                self.assertNotIn(state['workers'][0]['session_id'], text)
+        self.assertEqual(sorted(p.name for p in (run / 'iterations').iterdir()),
+                         ['iteration-1.md', 'iteration-2.md'])
+        self.assertEqual({p.name for p in run.iterdir()}, {'.workspace', 'iterations'})
+        self.assertTrue((relay.storage(run) / 'state.json').exists())
+        self.assertTrue((relay.storage(run) / 'turn-0001-attempt-01.prompt.txt').exists())
+        self.assertTrue((relay.storage(run) / 'turn-0001.json').exists())
+        self.assertEqual(self.contexts[0]['scratch_directory'], str(run / '.workspace/workers/codex-1'))
+
+    def test_retry_reuses_public_report_and_keeps_attempts_hidden(self):
+        run, state = self.create(['codex:1'])
+        self.fail_attempt(run, state, diagnostic='failed to initialize in-process app-server client: Operation not permitted')
+        report = run / 'iterations/iteration-1.md'
+        self.assertIn('could not initialize', report.read_text())
+        self.assertNotIn('Operation not permitted', report.read_text())
+        relay.recover(run, state, self.recovery_args(no_session_found=True, authorize_initial_start=True))
+        self.assertIn('Ready for another attempt', report.read_text())
+        self.contexts = []
+        with patch.object(relay.shutil, 'which', return_value='/fake'), patch.object(relay, 'execute', side_effect=self.fake_execute):
+            relay.step(run, state, argparse.Namespace(timeout=5))
+        self.assertIn('## Work completed', report.read_text())
+        self.assertEqual([p.name for p in (run / 'iterations').iterdir()], ['iteration-1.md'])
+        self.assertTrue((relay.storage(run) / 'turn-0001-attempt-01.stderr').exists())
+        self.assertTrue((relay.storage(run) / 'turn-0001-attempt-02.prompt.txt').exists())
+
+    def test_legacy_output_is_not_silently_moved(self):
+        run = self.root / 'legacy'
+        run.mkdir()
+        (run / 'state.json').write_text('{"version": 3}')
+        with self.assertRaisesRegex(ValueError, 'legacy or missing layout'):
+            relay.storage(run)
+        self.assertEqual((run / 'state.json').read_text(), '{"version": 3}')
+        self.assertFalse((run / '.workspace').exists())
+
+    def test_finish_needs_no_summary_and_creates_no_deliverable(self):
+        run, state = self.create(['codex:1'])
+        state['status'] = 'blocked'
+        relay.write(relay.storage(run) / 'state.json', state)
+        result = subprocess.run(['python3', str(SCRIPT), 'finish', '--run', str(run)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = json.loads(result.stdout)
+        self.assertIsNotNone(updated['finalized_at'])
+        self.assertIsNone(updated['final'])
+        self.assertEqual({p.name for p in run.iterdir()}, {'.workspace', 'iterations'})
+
+    def test_recovery_does_not_move_task_deliverable_named_final(self):
+        run, state = self.create(['codex:1'])
+        self.fail_attempt(run, state)
+        deliverable = run / 'final.md'
+        deliverable.write_text('Task-requested content, not a controller summary.')
+        state['final'] = 'Previous private closure note.'
+        state['finalized_at'] = relay.timestamp()
+        relay.recover(run, state, self.recovery_args(no_session_found=True, authorize_initial_start=True))
+        self.assertEqual(deliverable.read_text(), 'Task-requested content, not a controller summary.')
+        self.assertEqual(state['recoveries'][-1]['previous_closure']['summary'], 'Previous private closure note.')
+        self.assertIsNone(state['finalized_at'])
 
 
 if __name__ == '__main__':

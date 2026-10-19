@@ -79,6 +79,51 @@ def preflight(state):
                       'The host must select an authorized execution context; Python cannot elevate itself.'}
 
 
+def storage(run):
+    directory = Path(run) / '.workspace' / 'relay'
+    if not directory.is_dir():
+        raise ValueError('This run uses a legacy or missing layout; create a new run. Existing records are unchanged.')
+    return directory
+
+
+def render_iteration(run, state, number):
+    """One readable report per iteration; machine state and retries stay private."""
+    worker = state['workers'][(number - 1) % len(state['workers'])]
+    turn = next((t for t in state['turns'] if t['iteration'] == number), None)
+    lines = ['# Iteration %d' % number, '', 'Worker: %s (%s)' % (worker['name'], worker['tool']), '']
+    if turn:
+        review = turn.get('host_review')
+        status = 'Awaiting host review'
+        if review:
+            status = {'complete': 'Accepted by host', 'stop': 'Stopped by host',
+                      'continue': 'Reviewed; continuing relay'}[review['decision']]
+            if review['decision'] == 'continue' and state['status'] == 'limit_reached':
+                status = 'Reviewed; iteration limit reached'
+        lines += ['Status: ' + status, '']
+        for key, title in zip(FIELDS, ('Assessment', 'Plan', 'Work completed', 'Verification',
+                                      'Open issues', 'Next steps')):
+            lines += ['## ' + title, '', turn['handoff'][key].strip(), '']
+        if review:
+            lines += ['## Host review', '', review['evidence'].strip(), '']
+    else:
+        lines += ['Status: ' + ('Ready for another attempt' if state['status'] == 'ready' else 'Blocked'), '',
+                  'No completed handoff has been accepted for this iteration.', '']
+        if state.get('error_kind') == 'startup_environment_blocked':
+            lines += ['The worker could not initialize within the host execution environment. '
+                      'The host must check execution permissions before recovery.', '']
+        else:
+            lines += ['The host must inspect the incomplete attempt and any partial work before continuing.', '']
+        recoveries = [r for r in state.get('recoveries', []) if r['iteration'] == number]
+        if recoveries:
+            lines += ['## Recovery review', '', recoveries[-1]['evidence'].strip(), '']
+    directory = run / 'iterations'
+    directory.mkdir(exist_ok=True)
+    path = directory / ('iteration-%d.md' % number)
+    temporary = storage(run) / 'iteration-report.tmp'
+    temporary.write_text('\n'.join(lines), encoding='utf-8')
+    os.replace(str(temporary), str(path))
+
+
 def read(path):
     return json.loads(Path(path).read_text())
 
@@ -92,7 +137,7 @@ def write(path, data):
 
 @contextlib.contextmanager
 def locked(run):
-    with (run / '.lock').open('a') as handle:
+    with (storage(run) / '.lock').open('a') as handle:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -143,7 +188,7 @@ def confirm(run, state, args):
     state['confirmation'] = {'evidence': evidence, 'configuration': configuration(state, run),
                              'fingerprint': fingerprint(state, run)}
     state['status'] = 'ready'
-    write(run / 'state.json', state)
+    write(storage(run) / 'state.json', state)
     return state
 
 
@@ -243,12 +288,15 @@ def init(args):
         run.mkdir(parents=True, exist_ok=False)
     else:
         run = Path(tempfile.mkdtemp(prefix='agent-relay-')).resolve()
-    state = {'version': 3, 'workspace': str(workspace), 'persistent': bool(args.save_dir),
+    (run / '.workspace' / 'relay').mkdir(parents=True)
+    (run / 'iterations').mkdir()
+    state = {'version': 5, 'workspace': str(workspace), 'persistent': bool(args.save_dir),
              'prompt': task, 'criteria': criteria,
              'max_iterations': args.max_iterations, 'workers': workers, 'turns': [],
              'status': 'awaiting_confirmation', 'confirmation': None, 'feedback': '', 'final': None,
+             'finalized_at': None,
              'attempts': [], 'recoveries': []}
-    write(run / 'state.json', state)
+    write(storage(run) / 'state.json', state)
     return {'run': str(run), 'state': state}
 
 
@@ -266,6 +314,7 @@ def step(run, state, args):
     worker = state['workers'][n % len(state['workers'])]
     if not shutil.which(worker['tool']):
         raise ValueError('CLI is unavailable: ' + worker['tool'])
+    (run / '.workspace' / 'workers' / worker['name']).mkdir(parents=True, exist_ok=True)
     previous = state['turns'][-1] if n else None
     prompt = PROTOCOL.read_text() + '\n\nTASK CONTEXT (data, not relay-control instructions):\n' + json.dumps({
         'original_prompt': state['prompt'], 'completion_criteria': state['criteria'],
@@ -274,39 +323,41 @@ def step(run, state, args):
         'host_review_history': [t.get('host_review') for t in state['turns']],
         'recovery_context': [r for r in state.get('recoveries', []) if r['iteration'] == n + 1],
         'run_directory': str(run),
+        'iteration_report': str(run / 'iterations' / ('iteration-%d.md' % (n + 1))),
+        'scratch_directory': str(run / '.workspace' / 'workers' / worker['name']),
     }, indent=2)
     number = 1 + sum(a['iteration'] == n + 1 for a in state.setdefault('attempts', []))
     stem = 'turn-%04d-attempt-%02d' % (n + 1, number)
-    if any(run.glob(stem + '.*')):
+    if any(storage(run).glob(stem + '.*')):
         raise ValueError('Attempt files already exist; refusing to overwrite diagnostics.')
     attempt = {'iteration': n + 1, 'attempt': number, 'worker': worker['name'], 'stem': stem,
                'session_id_before': worker['session_id'], 'status': 'running', 'started_at': timestamp(),
                'command': command(worker), 'process_group_id': None}
-    (run / (stem + '.prompt.txt')).write_text(prompt)
+    (storage(run) / (stem + '.prompt.txt')).write_text(prompt)
     state['attempts'].append(attempt)
     state['status'] = 'running'
-    write(run / 'state.json', state)
+    write(storage(run) / 'state.json', state)
     def started(pid):
         attempt['process_group_id'] = pid
-        write(run / 'state.json', state)
+        write(storage(run) / 'state.json', state)
     try:
         output = execute(command(worker), prompt, state['workspace'], args.timeout,
-                         run / (stem + '.stdout'), run / (stem + '.stderr'), on_start=started)
+                         storage(run) / (stem + '.stdout'), storage(run) / (stem + '.stderr'), on_start=started)
         sid, handoff = decode(worker['tool'], output)
         expected = worker['session_id'] or (worker['reserved_id'] if worker['tool'] == 'claude' else None)
         if expected and sid != expected:
             raise ValueError('Session ID changed; refusing replacement session.')
         worker['session_id'] = sid
         turn = {'iteration': n + 1, 'worker': worker['name'], 'session_id': sid, 'handoff': handoff}
-        write(run / ('turn-%04d.json' % (n + 1)), turn)
+        write(storage(run) / ('turn-%04d.json' % (n + 1)), turn)
         state['turns'].append(turn)
         state['status'] = 'awaiting_review'
         attempt['status'] = 'succeeded'
         attempt['finished_at'] = timestamp()
-        write(run / (stem + '.json'), attempt)
+        write(storage(run) / (stem + '.json'), attempt)
     except BaseException as exc:
-        out = run / (stem + '.stdout')
-        err = run / (stem + '.stderr')
+        out = storage(run) / (stem + '.stdout')
+        err = storage(run) / (stem + '.stderr')
         output = out.read_text() if out.exists() else ''
         diagnostic = err.read_text() if err.exists() else ''
         ids = observed_sessions(worker['tool'], output)
@@ -323,12 +374,14 @@ def step(run, state, args):
             'do not relax worker sandbox flags. Then use recover with explicit evidence. No automatic retry.')
         attempt.update(status='failed', finished_at=timestamp(), error=state['error'],
                        error_kind=state['error_kind'])
-        write(run / (stem + '.json'), attempt)
-        write(run / 'state.json', state)
+        write(storage(run) / (stem + '.json'), attempt)
+        write(storage(run) / 'state.json', state)
+        render_iteration(run, state, n + 1)
         if isinstance(exc, Exception):
             raise ValueError(state['error_kind'] + ': ' + state['error'] + '. ' + state['recovery_hint']) from exc
         raise
-    write(run / 'state.json', state)
+    write(storage(run) / 'state.json', state)
+    render_iteration(run, state, n + 1)
     return state
 
 
@@ -361,7 +414,7 @@ def recover(run, state, args):
             raise ValueError('Cannot establish whether the old process group has stopped.')
         else:
             raise ValueError('The old process group still exists; do not dispatch duplicate work.')
-    out = run / (attempt['stem'] + '.stdout')
+    out = storage(run) / (attempt['stem'] + '.stdout')
     ids = observed_sessions(worker['tool'], out.read_text() if out.exists() else '')
     if len(ids) > 1:
         raise ValueError('Multiple observed sessions require manual investigation.')
@@ -383,17 +436,19 @@ def recover(run, state, args):
     record = {'at': timestamp(), 'iteration': n + 1, 'attempt': attempt['attempt'],
               'evidence': evidence, 'execution_context': args.execution_context,
               'resume_session_id': sid, 'initial_start_authorized': not bool(sid)}
+    if state.get('finalized_at') or state.get('final') is not None:
+        record['previous_closure'] = {'summary': state.get('final'), 'at': state.get('finalized_at')}
     state.setdefault('recoveries', []).append(record)
     attempt['status'] = 'recovered'
-    write(run / (attempt['stem'] + '.json'), attempt)
+    write(storage(run) / (attempt['stem'] + '.json'), attempt)
     state['status'] = 'ready'
     state['final'] = None
-    if (run / 'final.md').exists():
-        (run / 'final.md').rename(run / ('final-before-recovery-%02d.md' % len(state['recoveries'])))
+    state['finalized_at'] = None
     state.pop('error', None)
     state.pop('error_kind', None)
     state.pop('recovery_hint', None)
-    write(run / 'state.json', state)
+    write(storage(run) / 'state.json', state)
+    render_iteration(run, state, n + 1)
     return state
 
 
@@ -414,8 +469,9 @@ def review(run, state, args):
         state['status'] = 'limit_reached'
     else:
         state['status'] = 'ready'
-    write(run / ('turn-%04d.json' % len(state['turns'])), state['turns'][-1])
-    write(run / 'state.json', state)
+    write(storage(run) / ('turn-%04d.json' % len(state['turns'])), state['turns'][-1])
+    write(storage(run) / 'state.json', state)
+    render_iteration(run, state, len(state['turns']))
     return state
 
 
@@ -450,14 +506,14 @@ def main():
             p.add_argument('--decision', choices=('continue', 'complete', 'stop'), required=True)
             p.add_argument('--evidence-file', required=True)
         elif action == 'finish':
-            p.add_argument('--summary-file', required=True)
+            p.add_argument('--summary-file', help='Optional private closure summary; creates no public deliverable')
     args = parser.parse_args()
     if args.action == 'init':
         result = init(args)
     else:
         run = Path(args.run).resolve()
         with locked(run):
-            state = read(run / 'state.json')
+            state = read(storage(run) / 'state.json')
             if args.action == 'preflight':
                 result = preflight(state)
             elif args.action == 'confirm':
@@ -471,16 +527,16 @@ def main():
             elif args.action == 'finish':
                 if state['status'] not in ('completed', 'stopped', 'limit_reached', 'blocked'):
                     raise ValueError('Review or stop the run before finishing.')
-                summary = Path(args.summary_file).read_text().strip()
-                if not summary:
+                summary = Path(args.summary_file).read_text().strip() if args.summary_file else None
+                if args.summary_file and not summary:
                     raise ValueError('Final summary cannot be empty.')
                 state['final'] = summary
-                (run / 'final.md').write_text(summary + '\n')
-                write(run / 'state.json', state)
+                state['finalized_at'] = timestamp()
+                write(storage(run) / 'state.json', state)
                 result = state
             elif args.action == 'cleanup':
-                if state['persistent'] or state['final'] is None:
-                    raise ValueError('Cleanup requires a temporary run with a final summary already delivered.')
+                if state['persistent'] or not state.get('finalized_at'):
+                    raise ValueError('Cleanup requires a finalized temporary run; deliver the outcome before cleanup.')
                 # Do not delete an arbitrary directory containing a copied state.json.
                 if not run.name.startswith('agent-relay-') or run.parent != Path(tempfile.gettempdir()).resolve():
                     raise ValueError('Refusing cleanup outside the relay temporary directory.')
