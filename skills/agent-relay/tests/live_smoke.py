@@ -29,6 +29,8 @@ def main():
     parser.add_argument('--claude-model')
     parser.add_argument('--codex-effort')
     parser.add_argument('--claude-effort')
+    parser.add_argument('--challenge', action='store_true',
+                        help='After turn one, introduce an artifact error that contradicts its handoff')
     parser.add_argument('--approve-test', action='store_true', required=True,
                         help='Explicitly authorize this four-turn test with the supplied settings')
     options = parser.parse_args()
@@ -45,14 +47,17 @@ def main():
     prompt.write_text('Build ledger.txt in the workspace over four relay turns. During EACH turn, '
         'read the current ledger if it exists, assess its correctness, and append EXACTLY ONE line '
         'formatted ITERATION WORKER using your assigned integer iteration and worker name from '
-        'the relay task context. Preserve all previous lines. Do not add a header or extra text. '
+        'the relay task context. Preserve correct previous lines; repair incorrect earlier entries '
+        'when the actual file differs from the required iteration/worker assignments. '
+        'Do not add a header or extra text. '
         'Do not write future iterations. Use file tools to make the actual change. '
         'Verify the file after editing. Write a short supporting note in scratch_directory/support.txt. '
         'Keep all optional working files in that hidden directory. This is a small test; do not browse or delegate.')
     criteria = private / 'criteria.txt'
     criteria.write_text('After four turns ledger.txt contains exactly four ordered lines, '
                         'each matching that turn number and its assigned worker. '
-                        'On each turn only one line is appended and all earlier lines are preserved.')
+                        'Each turn appends its assigned line and preserves correct earlier lines. '
+                        'Incorrect earlier entries must be corrected against the actual assignments.')
     args = ['init', '--workspace', str(workspace), '--prompt-file', str(prompt),
             '--criteria-file', str(criteria), '--max-iterations', '4', '--save-dir', str(workspace / 'relay-output')]
     for worker in workers:
@@ -73,6 +78,8 @@ def main():
     call('confirm', '--run', run, '--confirmation-file', str(approval))
     expected = []
     for n in range(4):
+        if options.challenge and n == 1:
+            (workspace / 'ledger.txt').write_text('1 wrong-worker\n')
         state = call('step', '--run', run, '--timeout', '600')
         turn = state['turns'][-1]
         expected.append('%d %s' % (n + 1, turn['worker']))
@@ -81,7 +88,7 @@ def main():
             raise AssertionError('Artifact mismatch: %r != %r' % (actual, expected))
         evidence = private / ('review-%d.txt' % (n + 1))
         evidence.write_text('Host read ledger.txt and verified exact ordered content: %r. '
-                            'All previous entries were preserved. %s' %
+                            'All required earlier entries match their assignments. %s' %
                             (actual, 'Four-turn goal is met.' if n == 3 else 'Continue with one new line.'))
         state = call('review', '--run', run, '--decision', 'complete' if n == 3 else 'continue',
                      '--evidence-file', str(evidence))
@@ -91,7 +98,9 @@ def main():
     assert sorted(p.name for p in reports.iterdir()) == ['iteration-%d.md' % n for n in range(1, 5)]
     for n in range(1, 5):
         report = (reports / ('iteration-%d.md' % n)).read_text()
-        assert '## Assessment' in report and '## Host review' in report
+        assert all(heading in report for heading in (
+            '## 1. Assessment of the previous iteration', '## 2. Proposal and execution plan',
+            '## 3. Results and handoff', '### Progress since the previous iteration', '## Host review'))
     assert {p.name for p in Path(run).iterdir()} == {'.workspace', 'iterations'}
     for worker in state['workers']:
         assert (Path(run) / '.workspace' / 'workers' / worker['name'] / 'support.txt').is_file()

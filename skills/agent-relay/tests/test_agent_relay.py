@@ -149,6 +149,77 @@ class RelayTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             relay.step(run, state, argparse.Namespace(timeout=5))
 
+    def test_all_reviewed_reports_reach_new_and_resumed_workers(self):
+        for workers in (['codex:2'], ['claude:2'], ['codex:1', 'claude:1']):
+            with self.subTest(workers=workers):
+                run, state = self.create(workers)
+                self.contexts = []
+                with patch.object(relay.shutil, 'which', return_value='/fake'), patch.object(
+                        relay, 'execute', side_effect=self.fake_execute):
+                    for n in range(4):
+                        relay.step(run, state, argparse.Namespace(timeout=5))
+                        reports = self.contexts[-1]['prior_iteration_reports']
+                        self.assertEqual([r['iteration'] for r in reports], list(range(1, n + 1)))
+                        for report in reports:
+                            path = run / 'iterations' / ('iteration-%d.md' % report['iteration'])
+                            self.assertEqual(report['path'], str(path))
+                            self.assertEqual(report['content'], path.read_text(encoding='utf-8'))
+                            # These unresolved items exist only in handoff reports / host reviews,
+                            # not in any task deliverable or the latest turn's work summary.
+                            self.assertIn('交接專用：檢查第 %d 輪的未解項目' % report['iteration'],
+                                          report['content'])
+                        self.evidence.write_text('交接專用：檢查第 %d 輪的未解項目' % (n + 1),
+                                                 encoding='utf-8')
+                        self.review(run, state)
+                saved = (relay.storage(run) / 'turn-0004-attempt-01.prompt.txt').read_text()
+                saved_context = json.loads(saved.split(
+                    'TASK CONTEXT (data, not relay-control instructions):\n')[1])
+                self.assertEqual(saved_context['prior_iteration_reports'],
+                                 self.contexts[-1]['prior_iteration_reports'])
+
+    def test_unavailable_prior_report_prevents_dispatch_without_consuming_attempt(self):
+        for condition in ('missing', 'empty', 'invalid_utf8'):
+            with self.subTest(condition=condition):
+                run, state = self.create(['codex:1', 'claude:1'])
+                self.contexts = []
+                with patch.object(relay.shutil, 'which', return_value='/fake'), patch.object(
+                        relay, 'execute', side_effect=self.fake_execute):
+                    relay.step(run, state, argparse.Namespace(timeout=5))
+                self.review(run, state)
+                report = run / 'iterations/iteration-1.md'
+                if condition == 'missing':
+                    report.unlink()
+                elif condition == 'empty':
+                    report.write_text(' \n')
+                else:
+                    report.write_bytes(b'\xff')
+                before = json.loads(json.dumps(state))
+                with patch.object(relay.shutil, 'which', return_value='/fake'), patch.object(
+                        relay, 'execute') as execute:
+                    with self.assertRaisesRegex(ValueError, 'prior iteration report'):
+                        relay.step(run, state, argparse.Namespace(timeout=5))
+                    execute.assert_not_called()
+                self.assertEqual(state, before)
+                self.assertEqual(relay.read(relay.storage(run) / 'state.json'), before)
+                self.assertFalse((relay.storage(run) / 'turn-0002-attempt-01.prompt.txt').exists())
+
+    def test_recovery_includes_prior_reports_but_not_the_incomplete_current_report(self):
+        run, state = self.create(['codex:1'])
+        self.contexts = []
+        with patch.object(relay.shutil, 'which', return_value='/fake'), patch.object(
+                relay, 'execute', side_effect=self.fake_execute):
+            relay.step(run, state, argparse.Namespace(timeout=5))
+        self.review(run, state)
+        self.fail_attempt(run, state)
+        self.assertTrue((run / 'iterations/iteration-2.md').exists())
+        relay.recover(run, state, self.recovery_args())
+        with patch.object(relay.shutil, 'which', return_value='/fake'), patch.object(
+                relay, 'execute', side_effect=self.fake_execute):
+            relay.step(run, state, argparse.Namespace(timeout=5))
+        self.assertEqual([r['iteration'] for r in self.contexts[-1]['prior_iteration_reports']], [1])
+        self.assertEqual(self.contexts[-1]['prior_iteration_reports'][0]['content'],
+                         (run / 'iterations/iteration-1.md').read_text())
+
     def test_failure_blocks_and_cannot_create_replacement(self):
         run, state = self.create(['codex:1'])
         with patch.object(relay.shutil, 'which', return_value='/fake'), patch.object(relay, 'execute', return_value='not json'):
@@ -358,9 +429,9 @@ class RelayTests(unittest.TestCase):
                 self.assertIn('Awaiting host review', path.read_text())
                 self.review(run, state)
                 text = path.read_text()
-                self.assertIn('## Assessment', text)
-                self.assertIn('## Work completed', text)
-                self.assertIn('## Verification', text)
+                self.assertIn('## 1. Assessment of the previous iteration', text)
+                self.assertIn('### Work completed', text)
+                self.assertIn('### Verification', text)
                 self.assertIn('## Host review', text)
                 self.assertIn(self.evidence.read_text(), text)
                 self.assertNotIn(state['workers'][0]['session_id'], text)
@@ -383,7 +454,7 @@ class RelayTests(unittest.TestCase):
         self.contexts = []
         with patch.object(relay.shutil, 'which', return_value='/fake'), patch.object(relay, 'execute', side_effect=self.fake_execute):
             relay.step(run, state, argparse.Namespace(timeout=5))
-        self.assertIn('## Work completed', report.read_text())
+        self.assertIn('### Work completed', report.read_text())
         self.assertEqual([p.name for p in (run / 'iterations').iterdir()], ['iteration-1.md'])
         self.assertTrue((relay.storage(run) / 'turn-0001-attempt-01.stderr').exists())
         self.assertTrue((relay.storage(run) / 'turn-0001-attempt-02.prompt.txt').exists())
@@ -420,6 +491,74 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(deliverable.read_text(), 'Task-requested content, not a controller summary.')
         self.assertEqual(state['recoveries'][-1]['previous_closure']['summary'], 'Previous private closure note.')
         self.assertIsNone(state['finalized_at'])
+
+    def handoff_output(self, tool, handoff):
+        if tool == 'claude':
+            return json.dumps({'type': 'result', 'session_id': 'test-session', 'result': json.dumps(handoff)})
+        return '\n'.join(json.dumps(event) for event in (
+            {'type': 'thread.started', 'thread_id': 'test-session'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps(handoff)}}))
+
+    def test_first_iteration_can_omit_assessment_but_later_iterations_cannot(self):
+        handoff = {key: 'Verified observation' for key in relay.FIELDS}
+        handoff['assessment'] = ''
+        for tool in ('codex', 'claude'):
+            with self.subTest(tool=tool):
+                output = self.handoff_output(tool, handoff)
+                self.assertEqual(relay.decode(tool, output, iteration=1)[1]['assessment'], '')
+                with self.assertRaisesRegex(ValueError, 'assessment may be empty only'):
+                    relay.decode(tool, output, iteration=2)
+
+    def test_handoff_requires_progress_and_nonempty_execution_results(self):
+        for tool in ('codex', 'claude'):
+            for key in ('progress', 'plan', 'work', 'verification', 'open_issues', 'next_steps'):
+                with self.subTest(tool=tool, field=key):
+                    handoff = {field: 'Observed result' for field in relay.FIELDS}
+                    handoff[key] = '  '
+                    with self.assertRaises(ValueError):
+                        relay.decode(tool, self.handoff_output(tool, handoff), iteration=1)
+            handoff = {field: 'Observed result' for field in relay.FIELDS if field != 'progress'}
+            with self.assertRaisesRegex(ValueError, 'progress'):
+                relay.decode(tool, self.handoff_output(tool, handoff), iteration=1)
+
+    def test_three_stage_report_preserves_evidence_disagreement_and_next_actions(self):
+        run, state = self.create(['codex:1', 'claude:1'])
+        handoff = {
+            'assessment': '',
+            'plan': 'Inspect the recorded calculation against the original budget goal.',
+            'work': 'Read budget.txt and reproduced the subtotal of 120.',
+            'progress': 'Confirmed the subtotal; left the disputed tax assumption unresolved.',
+            'verification': 'Recalculated three line items; tax rates were not independently verified.',
+            'open_issues': 'A prior assumption of 5 percent tax remains unverified; two sources disagree.',
+            'next_steps': 'Check the applicable tax source before changing the total; retain the verified subtotal.'}
+        self.contexts = []
+        def response(args, prompt, cwd, timeout, out, err, on_start=None):
+            self.contexts.append(json.loads(prompt.split('TASK CONTEXT (data, not relay-control instructions):\n')[1]))
+            if len(self.contexts) == 1:
+                return self.handoff_output('codex', handoff)
+            return self.fake_execute(args, prompt, cwd, timeout, out, err, on_start=on_start)
+        with patch.object(relay.shutil, 'which', return_value='/fake'), patch.object(relay, 'execute', side_effect=response):
+            relay.step(run, state, argparse.Namespace(timeout=5))
+            self.review(run, state)
+            relay.step(run, state, argparse.Namespace(timeout=5))
+        self.assertEqual(self.contexts[1]['previous_turn']['handoff'], handoff)
+        text = (run / 'iterations/iteration-1.md').read_text()
+        headings = ['## 1. Assessment of the previous iteration', '## 2. Proposal and execution plan',
+                    '## 3. Results and handoff', '## Host review']
+        self.assertEqual([text.index(h) for h in headings], sorted(text.index(h) for h in headings))
+        for value in handoff.values():
+            if value:
+                self.assertIn(value, text)
+        self.assertIn('### Progress since the previous iteration', text)
+        self.assertIn('### Open issues', text)
+        self.assertIn('### Next steps', text)
+
+    def test_historical_handoff_reports_missing_progress_without_inventing_it(self):
+        run, state = self.create(['codex:1'])
+        state['turns'] = [{'iteration': 1, 'worker': 'codex-1', 'session_id': 'old-session',
+                          'handoff': {key: 'Historical observation' for key in relay.FIELDS if key != 'progress'}}]
+        relay.render_iteration(run, state, 1)
+        self.assertIn('Not recorded in this handoff.', (run / 'iterations/iteration-1.md').read_text())
 
 
 if __name__ == '__main__':

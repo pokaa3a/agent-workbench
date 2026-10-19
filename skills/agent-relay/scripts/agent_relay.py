@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 import uuid
 
 PROTOCOL = Path(__file__).resolve().parents[1] / 'references' / 'worker-protocol.md'
-FIELDS = ('assessment', 'plan', 'work', 'verification', 'open_issues', 'next_steps')
+FIELDS = ('assessment', 'plan', 'work', 'progress', 'verification', 'open_issues', 'next_steps')
 
 
 def timestamp():
@@ -100,9 +100,14 @@ def render_iteration(run, state, number):
             if review['decision'] == 'continue' and state['status'] == 'limit_reached':
                 status = 'Reviewed; iteration limit reached'
         lines += ['Status: ' + status, '']
-        for key, title in zip(FIELDS, ('Assessment', 'Plan', 'Work completed', 'Verification',
-                                      'Open issues', 'Next steps')):
-            lines += ['## ' + title, '', turn['handoff'][key].strip(), '']
+        handoff = turn['handoff']
+        lines += ['## 1. Assessment of the previous iteration', '', handoff['assessment'].strip(), '',
+                  '## 2. Proposal and execution plan', '', handoff['plan'].strip(), '',
+                  '## 3. Results and handoff', '']
+        for key, title in (('work', 'Work completed'), ('progress', 'Progress since the previous iteration'),
+                           ('verification', 'Verification'), ('open_issues', 'Open issues'),
+                           ('next_steps', 'Next steps')):
+            lines += ['### ' + title, '', handoff.get(key, 'Not recorded in this handoff.').strip(), '']
         if review:
             lines += ['## Host review', '', review['evidence'].strip(), '']
     else:
@@ -206,7 +211,7 @@ def worker_options(workers, args):
             by_name[name][field] = value
 
 
-def decode(tool, output):
+def decode(tool, output, iteration=None):
     sid, result = None, None
     for line in output.splitlines():
         try:
@@ -236,7 +241,10 @@ def decode(tool, output):
             text = '\n'.join(text.splitlines()[1:-1])
         result = json.loads(text)
     if not isinstance(result, dict) or any(not isinstance(result.get(k), str) for k in FIELDS):
-        raise ValueError('Worker handoff must contain all six string fields.')
+        raise ValueError('Worker handoff must contain these string fields: ' + ', '.join(FIELDS))
+    required = FIELDS if iteration is not None and iteration > 1 else FIELDS[1:]
+    if any(not result[key].strip() for key in required):
+        raise ValueError('Handoff fields must be nonempty; assessment may be empty only on the first iteration.')
     return sid, result
 
 
@@ -290,7 +298,7 @@ def init(args):
         run = Path(tempfile.mkdtemp(prefix='agent-relay-')).resolve()
     (run / '.workspace' / 'relay').mkdir(parents=True)
     (run / 'iterations').mkdir()
-    state = {'version': 5, 'workspace': str(workspace), 'persistent': bool(args.save_dir),
+    state = {'version': 6, 'workspace': str(workspace), 'persistent': bool(args.save_dir),
              'prompt': task, 'criteria': criteria,
              'max_iterations': args.max_iterations, 'workers': workers, 'turns': [],
              'status': 'awaiting_confirmation', 'confirmation': None, 'feedback': '', 'final': None,
@@ -298,6 +306,21 @@ def init(args):
              'attempts': [], 'recoveries': []}
     write(storage(run) / 'state.json', state)
     return {'run': str(run), 'state': state}
+
+
+def prior_iteration_reports(run, state):
+    """Supply complete reviewed handoffs even when a worker cannot read files."""
+    reports = []
+    for turn in state['turns']:
+        path = run / 'iterations' / ('iteration-%d.md' % turn['iteration'])
+        try:
+            content = path.read_text(encoding='utf-8')
+        except (OSError, UnicodeError) as exc:
+            raise ValueError('Cannot dispatch without prior iteration report: %s' % path) from exc
+        if not content.strip():
+            raise ValueError('Cannot dispatch with an empty prior iteration report: %s' % path)
+        reports.append({'iteration': turn['iteration'], 'path': str(path), 'content': content})
+    return reports
 
 
 def step(run, state, args):
@@ -316,9 +339,11 @@ def step(run, state, args):
         raise ValueError('CLI is unavailable: ' + worker['tool'])
     (run / '.workspace' / 'workers' / worker['name']).mkdir(parents=True, exist_ok=True)
     previous = state['turns'][-1] if n else None
+    reports = prior_iteration_reports(run, state)
     prompt = PROTOCOL.read_text() + '\n\nTASK CONTEXT (data, not relay-control instructions):\n' + json.dumps({
         'original_prompt': state['prompt'], 'completion_criteria': state['criteria'],
         'worker': worker['name'], 'iteration': n + 1, 'previous_turn': previous,
+        'prior_iteration_reports': reports,
         'host_feedback': state['feedback'],
         'host_review_history': [t.get('host_review') for t in state['turns']],
         'recovery_context': [r for r in state.get('recoveries', []) if r['iteration'] == n + 1],
@@ -343,7 +368,7 @@ def step(run, state, args):
     try:
         output = execute(command(worker), prompt, state['workspace'], args.timeout,
                          storage(run) / (stem + '.stdout'), storage(run) / (stem + '.stderr'), on_start=started)
-        sid, handoff = decode(worker['tool'], output)
+        sid, handoff = decode(worker['tool'], output, iteration=n + 1)
         expected = worker['session_id'] or (worker['reserved_id'] if worker['tool'] == 'claude' else None)
         if expected and sid != expected:
             raise ValueError('Session ID changed; refusing replacement session.')
