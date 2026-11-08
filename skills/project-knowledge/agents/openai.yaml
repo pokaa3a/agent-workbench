@@ -1,0 +1,4 @@
+interface:
+  display_name: "Project Knowledge"
+  short_description: "Load project goals, tasks, decisions, and durable knowledge with a small cited budget"
+  default_prompt: "Use $project-knowledge to orient on this project (overview), retrieve the relevant context (query), and record durable knowledge after changes."
